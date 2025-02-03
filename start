@@ -1,0 +1,644 @@
+// ++++++++++++++++++++++++++++++++++++++++++
+// ++++++++++++++++++++++++++++++++++++++++++
+// +++ HOME_SYS +++++++++++++++++++++++++++++
+// +++ BY: SERGEI  ++++++++++++++++++++++++++
+// ++++++++++++++++++++++++++++++++++++++++++
+// ++++++++++++++++++++++++++++++++++++++++++
+
+// libraries ----------------------------------------------------------------------------
+#include <Wire.h>              // Library for I2C communication
+#include <U8g2lib.h>           // Library for OLED display
+#include <SPI.h>               // Library for SPI communication (for RFID)
+#include <MFRC522.h>           // Library for RFID module
+#include <VL53L1X.h>           // Library for the VL53L1X distance sensor
+#include <Adafruit_NeoPixel.h> // Library for controlling LED matrix
+#include <pitches.h>           // Library for Passive Buzzer
+
+
+// initialize the OLED display -----------------------------------------------------------
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+
+
+// PIR motion sensor setup ---------------------------------------------------------------
+#define PIR_PIN 2 // PIR motion sensor pin
+
+
+// RFID module setup ---------------------------------------------------------------------
+#define RST_PIN 5              // RFID reset pin
+#define SS_PIN 53              // RFID SDA pin
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+
+// VL53L1X distance sensor setup ---------------------------------------------------------
+// using uint16_t because sensor reads were going negative at times
+// and this avoids sensor reading negative numbers
+VL53L1X sensor;
+const uint16_t MIN_RANGE = 40;   // MIN distance the sensor detects
+const uint16_t MAX_RANGE = 1200; // MAX distance the sensor detects
+
+
+// LED matrix setup ----------------------------------------------------------------------
+#define LED_PIN 6 // LED matrix pin
+// initialize the LED matrix 64 LEDs
+Adafruit_NeoPixel LED = Adafruit_NeoPixel(64, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+
+// Passive buzzer setup ------------------------------------------------------------------
+#define BUZZER_PIN 9  // Passive buzzer pin
+
+
+// timers to keep track for certain functions within system --------------------------------------------
+// used unsigned long since im working with time which
+// real time has no negative time and can store large values
+// and works with Arduinos millis() function
+const unsigned long motionCheckInterval = 240000; // checks PIR sensor every 4 minutes (in ms)
+unsigned long lastMotionTime = 0;                 // tracks the last time PIR motion was detected
+unsigned long lastMotionCheck = 0;                // tracks the last time PIR motion was checked
+unsigned long offPIR = 0;                         // turns "off" PIR sensor until x amount of time (x = time assigned)
+unsigned long oledOffTime = 240000;               // turns off OLED screen every 4 minutes (in ms)
+unsigned long systemOffTime = 300000;             // turns everything off after 5 minutes of inactivity
+unsigned long lastSerialPrintTime = 0;            // tracks the last time the serial output was updated
+unsigned long serialPrintInterval = 1000;         // prints serial data every 1 second (normal serial print was fast)
+unsigned long lastToneTime = 0;                   // tracks the last time a tone was played (alarm sound)
+unsigned long noteStartTime = 0;                  // tracks the start time of the current note (music melody)
+
+
+// state variables -----------------------------------------------------------------------
+bool isToneHigh = true;       // switches between high and low tones (alarm sound)
+bool playMelody = false;      // music playback in HomeLink screen (music melody)
+bool motionDetected = false;  // tracks if motion is detected (PIR sensor)
+bool rfidAuthorized = false;  // tracks if the RFID card is authorized
+bool systemActive = false;    // tracks if the system is active
+bool musicHasPlayed = false;  // tracks if the music has already played (to stop music from looping)
+
+
+// assigned variables ---------------------------------------------------------------------
+const int LED_MAX_BRIGHT = 150;     // max brightness for LED
+int currentBrightness = 13;         // initial brightness of LED (5% of max [set to 150 (from 255)])
+int currentNote = 0;                // tracks the current note being played (music melody)
+String currentScreen = "HomeLink";  // tracks the current display screen
+
+
+// setup ----------------------------------------------------------------------------------
+void setup() {
+  Serial.begin(9600); // Serial Monitor initialized
+
+
+  u8g2.begin(); // initializing OLED display
+  u8g2.clear(); // clears OLED display to start
+
+
+  pinMode(PIR_PIN, INPUT);  // PIR motion sensor as input
+
+
+  SPI.begin();      // SPI comms for RFID initialize
+  rfid.PCD_Init();  // RFID module initialize
+
+
+  pinMode(BUZZER_PIN, OUTPUT);  // Passive Buzzer initialize
+
+
+  Wire.begin();           // initializing I2C comms for VL53L1X sensor
+  sensor.setTimeout(500); // 500ms timeout for functionality (more responsive/accurate)
+  if (!sensor.init()) {   // checks sensor initializes successfully
+    Serial.println("VL53L1X initialization failed.");
+    delay(700);           // gives user 700ms to see message above before next line:
+    while (1);            // stops program from running cause sensor not working
+  }
+
+
+  sensor.setDistanceMode(VL53L1X::Long);    // configuring VL53L1X sensor for long distance reading (for non demo)
+  sensor.setMeasurementTimingBudget(20000); // setting timing fast for measuring distance (20ms)
+  sensor.startContinuous(50);               // takes new measurements every 50ms (reads 20 times per second)
+
+
+  LED.begin();            // initializing LED control
+  resetLED();             // function to clear() and show()
+  currentBrightness = 0;  // starts LED at MIN brightness
+}
+
+
+// main loop -----------------------------------------------------------------------------
+void loop() {
+  unsigned long currentMillis = millis(); // gets the current time since program has started running (in ms)
+
+
+    if (currentMillis > offPIR && digitalRead(PIR_PIN) == HIGH) { // if motion (PIR) detected
+      Serial.println("PIR motion detected.");
+      motionDetected = true;          // updates motionDetected to true
+      lastMotionTime = millis();      // updates lastMotionTime time
+      offPIR = currentMillis + 60000; // turns off PIR for 1 minute
+
+
+      if (currentScreen == "HomeLink") {  // if not in HomeLink screen, switch to it
+        Serial.println("Switching to HomeLink screen.");
+        homeLinkScreen();   // calls function homeLinkScreen
+        playMelody = true;  // updates playMelody to true: starts playing HomeLink music
+      }
+    }
+
+
+  handleInactivity(); // call function to handle inactivity
+  handleRFID(); // call function to handle RFID interactions
+
+
+  if (playMelody && currentScreen == "HomeLink") {  // play music if in the HomeLink screen
+    playMusic();  // plays music without blocking other tasks
+  }
+
+
+  if (systemActive && currentScreen == "AdminGranted") {  // if system is active and screen is AdminGranted
+    adminGrantedRoutine(); // run AdminGrantedRoutine
+  }
+}
+
+
+// handle inactivity (turning off OLED screen & system after x amount time -----------------
+void handleInactivity() {
+  unsigned long interval = millis() - lastMotionTime; // time since last motion
+
+
+  if (interval > oledOffTime) { // if no motion for 4 minutes (OLED turns off)
+    systemActive = false;          // updates systemActive to false to deactivate the system
+    playMelody = false;            // stops music playback
+    currentScreen = "HomeLink";    // reset to HomeLink screen
+    resetLED();                    // fucntion to clear() and show()
+   
+    Serial.println("System reset to HomeLink due to inactivity.");
+    homeLinkScreen();              // display HomeLink screen
+  }
+
+
+  if (interval > oledOffTime + systemOffTime) { // if no motion for 7 minutes (everything turns off)
+    u8g2.clear();       // clears OLED display to start
+    u8g2.sendBuffer();  // update the OLED display
+    resetLED();         // fucntion to clear() and show()
+    playMelody = false; // stops music playback
+   
+    Serial.println("System fully off due to extended inactivity.");
+    while (digitalRead(PIR_PIN) != HIGH); // while PIR is LOW, wait for motion to restart (HIGH)
+
+
+    lastMotionTime = millis();  // resets lastMotionTime
+  }
+}
+
+
+// handles RFID card scanning --------------------------------------------------------------
+void handleRFID() {
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) { // if a new readbale card is detected
+    showLoadingBar(); // Display loading bar while validating
+
+
+    if (currentScreen == "HomeLink") {  // if on HomeLink screen
+      if (isRFIDAuthorized()) {         // check if RFID card is authorized
+        currentScreen = "AdminGranted"; // change screen to AdminGranted
+        adminGrantedScreen();           // display the AdminGranted screen
+        systemActive = true;            // update system Active to true to activate the system
+      } else {
+        accessDeniedScreen();           // display AccessDenied screen
+      }
+    } else if (currentScreen == "AdminGranted") { // if on AdminGranted screen
+      if (isRFIDAuthorized()) {         // re-validate the RFID card
+        currentScreen = "Goodbye";      // change screen to Goodbye
+        goodbyeScreen();                // display the Goodbye screen
+        u8g2.clearBuffer();             // clear OLED screen
+        u8g2.sendBuffer();              // update OLED screen
+        delay(6000);                    // delay for 6 seconds
+        systemActive = false;           // deactivate the system
+        currentScreen = "HomeLink";     // update currentScreen to HomeLink to go back to:
+        homeLinkScreen();               // display the HomeLink screen
+      } else {                                    
+        accessDeniedScreen();           // if the card is not authorized, display AccessDenied screen
+        currentScreen = "AdminGranted"; // change screen to AdminGranted
+        adminGrantedScreenReturn();     // display the AdminGranted screen
+        systemActive = true;            // activate the system
+      }
+    }
+
+
+    rfid.PICC_HaltA();  // turns off RFID comms
+  }
+}
+
+
+// return function (RFID card checker to authorized UID) -----------------------------------
+bool isRFIDAuthorized() {
+  byte authorizedUID[] = {0x90, 0xC2, 0x97, 0x37};             // predefined authorized UID
+  for (byte i = 0; i < rfid.uid.size; i++) {                   // compares each byte of the UID
+    if (rfid.uid.uidByte[i] != authorizedUID[i]) return false; // returns false if mismatch
+  }
+  return true;                                                 // returns true if UID matches
+}
+
+
+// function to start system functions ------------------------------------------------------
+void adminGrantedRoutine() {
+  uint16_t averagedDistance = getAverageDistance(); // gets the averaged distance
+  adjustLED(averagedDistance);                      // adjusts LED based on averaged distance
+  logInfo(averagedDistance);                        // logs averageDistance information to logInfo for serial monitor
+}
+
+
+// function to get the average distance from VL53L1X sensor ---------------------------------
+uint16_t getAverageDistance() {
+  static uint32_t sumDistance = 0;
+  static uint16_t count = 0;
+  static unsigned long lastAverageTime = 0;
+  static unsigned long lastRestartTime = 0;
+  static uint16_t lastValidDistance = MAX_RANGE; // goes back to last valid reading
+
+
+  uint16_t currentDistance = sensor.read(); // reads current distance
+
+
+  if (sensor.timeoutOccurred()) {             // restarts sensor if a timeout occurs
+    if (millis() - lastRestartTime > 5000) {  // wait 5 seconds
+      Serial.println("VL53L1X sensor timeout detected. Restarting VL53L1X sensor.");
+      sensor.stopContinuous();                // stops sensor
+      delay(100);                             // delay
+      sensor.startContinuous(50);             // starts sensor again
+      lastRestartTime = millis();             // updates lastRestartTime
+    }
+    Serial.println("Last valid distance due to timeout.");
+    return lastValidDistance;                 // return the last valid distance
+  }
+
+
+  if (currentDistance > MAX_RANGE) {  // if distance is more than MAX_RANGE:
+    currentDistance = MAX_RANGE;      // update currentDistance to MAX_RANGE
+  }
+
+
+  lastValidDistance = currentDistance;  // update the last valid distance
+  sumDistance += currentDistance;       // add currentDistance to total for averaging
+  count++;                              // increment to track number of measurements
+
+
+  if (millis() - lastAverageTime >= 2000) {    // calculates and resets average every 2 seconds
+    uint16_t averagedDistance;
+    if (count > 0) {                           // only valid readings to calculate the average
+      averagedDistance = sumDistance / count;  // calculates average
+    } else {
+      averagedDistance = MAX_RANGE;            // uses MAX_RANGE as default
+    }
+
+
+    sumDistance = 0;            // resets the sum for the next averaging cycle
+    count = 0;                  // resets the count of distance readings
+    lastAverageTime = millis(); // updates lastAverageTime for new averaging cycle
+
+
+    return averagedDistance;    // returns the calculated average distance
+  }
+
+
+  return currentDistance;       // returns the current distance while accumulating
+}
+
+
+// adjusts the LED brightness from averageDistance -------------------------------------------
+void adjustLED(uint16_t averagedDistance) {
+  int targetBrightness;
+  if (averagedDistance <= MIN_RANGE) {  // calculates brightness based on averagedDistance
+    targetBrightness = LED_MAX_BRIGHT;
+  } else {
+    targetBrightness = map(averagedDistance, MIN_RANGE, MAX_RANGE, LED_MAX_BRIGHT, 13);  // maps distance to brightness
+  }
+
+
+  targetBrightness = constrain(targetBrightness, 13, LED_MAX_BRIGHT);  // contrains brightness between 5% and 58%
+  if (abs(currentBrightness - targetBrightness) <= 2) { // dead zone to prevent rapid flickering for small changes
+    return; // skips updates for small differences
+  }
+
+
+  int fadeStep = 2; // sets fade by 2 increments (less = slower, more = faster)
+  if (currentBrightness < targetBrightness) {
+    currentBrightness = min(currentBrightness + fadeStep, targetBrightness);  // gradually increase
+  } else {
+    currentBrightness = max(currentBrightness - fadeStep, targetBrightness);  // gradually decrease
+  }
+
+
+  for (int i = 0; i < 64; i++) { // updates LED (for now 64 LEDs, but can be changed for less/more)
+    LED.setPixelColor(i, LED.Color(currentBrightness, currentBrightness, currentBrightness)); // set LED to white
+  }
+
+
+  for (int i = 64; i < LED.numPixels(); i++) {  // turns off the remaining LEDs not in use (future proof)
+    LED.setPixelColor(i, 0);  // turn off remaining LEDs
+  }
+
+
+  LED.show(); // updated LED
+}
+
+
+// animation from Arduino Library Examples (Adafruit NeoPixel) ------------------------------
+void theaterChase(uint32_t color, int wait) {
+  for (int q = 0; q < 3; q++) {
+    for (int i = 0; i < LED.numPixels(); i += 3) {
+      LED.setPixelColor(i + q, color);
+    }
+    LED.show();
+    delay(wait);
+    for (int i = 0; i < LED.numPixels(); i += 3) {
+      LED.setPixelColor(i + q, 0);
+    }
+  }
+}
+
+
+// serial print for debugging and to see if brightness and distance works -------------------
+void logInfo(uint16_t averagedDistance) {
+  if (millis() - lastSerialPrintTime >= serialPrintInterval) {
+    lastSerialPrintTime = millis();                                // updates lastSerialPrint
+    float brightnessPercent = (currentBrightness / 150.0) * 100.0; // calculates for percentage (max 150)
+
+
+    Serial.print("Averaged Distance: ");
+    Serial.print(averagedDistance);
+    Serial.println(" mm");
+
+
+    Serial.print("Brightness: ");
+    Serial.print(brightnessPercent, 1);
+    Serial.println("%");
+  }
+}
+
+
+// Screen Functions ------------------------------------------------------------------------
+void homeLinkScreen() {
+  Serial.println("Displaying HomeLink Screen.");
+
+
+  resetMelody();      // reset the music playback
+  playMelody = true;  // updates playMelody to true: starts playing HomeLink music (again to make sure its playing)
+
+
+  u8g2.clearBuffer();                           // clears OLED screen
+  u8g2.setFont(u8g2_font_logisoso20_tf);        // font
+  u8g2.drawStr(14, 33, "HOMELINK");             // x, y, string
+  u8g2.setFont(u8g2_font_fourmat_tf);           // font
+  u8g2.drawStr(51, 39, "AN HXI PRODUCT");       // x, y, string
+  u8g2.drawStr(22, 64, "(C) HXI DATA SYSTEMS"); // x, y, string
+  u8g2.sendBuffer();                            // sends to OLED screen
+}
+
+
+void adminGrantedScreen() {
+  Serial.println("Displaying AdminGranted Screen.");
+
+
+  resetMelody();
+  playMelody = false;
+
+
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_streamline_hand_signs_t);
+  u8g2.drawGlyph(50, 40, 0x3A);
+  u8g2.sendBuffer();
+
+
+  delay(1000);
+
+
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_bpixeldouble_tr);
+  u8g2.drawStr(7, 30, "ADMINISTRATOR");
+  u8g2.drawStr(5, 48, "RIGHTS GRANTED");
+  u8g2.sendBuffer();
+}
+
+
+void adminGrantedScreenReturn() {
+  Serial.println("Displaying AdminGranted Screen (Return).");
+
+
+  resetMelody();
+  playMelody = false;
+
+
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_bpixeldouble_tr);
+  u8g2.drawStr(7, 30, "ADMINISTRATOR");
+  u8g2.drawStr(5, 48, "RIGHTS GRANTED");
+  u8g2.sendBuffer();
+}
+
+
+void accessDeniedScreen() {
+  resetMelody();
+
+
+  LED.begin();
+  LED.show();
+  LED.setBrightness(60);
+
+
+  unsigned long startTime = millis(); // tracks the start time
+
+
+  while (millis() - startTime < 8000) {             // loops up until over 8 seconds
+    unsigned long interval = millis() - startTime;  // sets interval to time that has passed
+    if ((interval / 2000) % 2 == 0) {               // displays Admin Rights Denied for 2 seconds
+      u8g2.clearBuffer();
+      u8g2.setFont(u8g2_font_bpixeldouble_tr);
+      u8g2.drawStr(7, 30, "ADMINISTRATOR");
+      u8g2.drawStr(10, 48, "RIGHTS DENIED");
+      u8g2.sendBuffer();
+    } else {
+      u8g2.clearBuffer();
+      u8g2.setFont(u8g2_font_streamline_hand_signs_t);
+      u8g2.drawGlyph(50, 40, 0x35);
+      u8g2.sendBuffer();
+      u8g2.clearBuffer();
+      u8g2.drawGlyph(50, 40, 0x37);
+      u8g2.sendBuffer();
+    }
+
+
+    playAlarm(); // plays alarm sound
+
+
+    theaterChase(LED.Color(LED_MAX_BRIGHT, 0, 0), 60); // run LED animation continuously (red)
+  }
+
+
+  noTone(BUZZER_PIN); // stops Passive buzzer
+
+
+  resetLED();
+
+
+  homeLinkScreen(); // goes back to HomeLink screen
+}
+
+
+void goodbyeScreen() {
+  resetMelody();
+
+
+  resetLED();
+
+
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_streamline_hand_signs_t);
+  u8g2.drawGlyph(50, 40, 0x34);
+  u8g2.sendBuffer();
+
+
+  delay(1000);
+
+
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_bpixeldouble_tr);
+  u8g2.drawStr(40, 40, "GOODBYE");
+  u8g2.sendBuffer();
+
+
+  delay(3000);
+}
+
+
+// verifying loading bar animation -------------------------------------------------------
+void showLoadingBar() {
+  resetMelody();      // reset the music playback
+  playMelody = false; // disable music playback
+
+
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_bpixeldouble_tr);
+  u8g2.drawStr(14, 33, "VALIDATING...");
+
+
+  int barX = 14, barY = 43, barWidth = 98, barHeight = 4 ; // setting size of bar (x, y, width, height)
+  for (int i = 0; i <= barWidth; i += 3) {                 // loop to fill bar by 3 increments
+    u8g2.drawFrame(barX, barY, barWidth, barHeight);       // frame of bar
+    u8g2.drawBox(barX, barY, i, barHeight);                // progress bar
+    u8g2.sendBuffer();                                     // sends to OLED screen
+  }
+}
+
+
+// alarm and music -----------------------------------------------------------------------
+void playAlarm() {
+  unsigned long currentTime = millis();
+  if (currentTime - lastToneTime >= 2000) { // checks if 2 seconds have passed since the last tone
+    noTone(BUZZER_PIN); // stosp the current tone before playing a new one
+   
+    if (isToneHigh == 0) {  // alternates between two tones: 78 Hz and 1760 Hz
+      tone(BUZZER_PIN, 78);
+    } else {
+      tone(BUZZER_PIN, 1760);
+    }
+
+
+    isToneHigh = (isToneHigh + 1) % 2; // alternates between 0 and 1
+    lastToneTime = currentTime; // updates the last tone switch time
+  }
+}
+
+
+void playMusic() {
+  // from https://github.com/robsoncouto/arduino-songs/tree/master
+  // modified to work how i want it to function
+
+
+  const int notes[] = {   // notes in Hz
+    174, 185, 69, 116, 233, // F3, F#3, C#2, A#2, A#3
+    174, 185, 69, 116, 233,
+    174, 185, 69, 116, 233,
+    174, 185, 69, 116, 233,
+    78, 174, 69, 116, 233,  // D#2, F3, C#2, A#2, A#3
+    78, 174, 69, 116, 233,
+    78, 174, 69, 116, 233,
+    78, 174, 69, 116, 233,
+    78, 174, 69, 123, 247,  // D#2, F3, C#2, B2, B3
+    78, 174, 69, 123, 247,
+    78, 174, 69, 123, 247,
+    78, 174, 69, 123, 247,
+    78, 174, 69, 116, 233,  // D#2, F3, C#2, A#2, A#3
+    78, 174, 69, 116, 233,
+    78, 174, 69, 116, 233,
+    78, 174, 69, 116, 233
+  };
+
+
+  const int durations[] = { // 200ms (first 4 notes) & 400ms (5th note)
+    200, 200, 200, 200, 400,
+    200, 200, 200, 200, 400,
+    200, 200, 200, 200, 400,
+    200, 200, 200, 200, 400,
+    200, 200, 200, 200, 400,
+    200, 200, 200, 200, 400,
+    200, 200, 200, 200, 400,
+    200, 200, 200, 200, 400,
+    200, 200, 200, 200, 400,
+    200, 200, 200, 200, 400,
+    200, 200, 200, 200, 400,
+    200, 200, 200, 200, 400,
+    200, 200, 200, 200, 400,
+    200, 200, 200, 200, 400,
+    200, 200, 200, 200, 400,
+    200, 200, 200, 200, 400
+  };
+
+
+  int musicSize = sizeof(notes) / sizeof(notes[0]); // total notes
+
+
+  unsigned long currentTime = millis();
+
+
+  if (musicHasPlayed) { // if the music played already:
+    noTone(BUZZER_PIN); // stop Passive buzzer
+    playMelody = false; // update playMelody to false
+    return;             // return
+  }
+
+
+  if (!playMelody || currentScreen != "HomeLink") { // if playback is disabled or not on the HomeLink screen:
+    noTone(BUZZER_PIN); // stop Passive buzzer
+    return;             // return
+  }
+
+
+  if (currentTime - noteStartTime >= durations[currentNote]) {  // if its time to play the next note
+    noTone(BUZZER_PIN); // stop Passive buzzer
+
+
+    currentNote++;  // go to the next note
+
+
+    if (currentNote >= musicSize) { // if currentNote is more than musicSize:
+      currentNote = 0;              // reset the note index
+      musicHasPlayed = true;        // set true to indicate music has played
+      Serial.println("Music playback complete.");
+      return;                       // return
+    }
+
+
+    tone(BUZZER_PIN, notes[currentNote]); // play the current note
+
+
+    noteStartTime = currentTime;  // update noteStartTime
+  }
+}
+
+
+// function to reset music from screen to screen ------------------------------------------
+void resetMelody() {
+  currentNote = 0;         // reset to the first note
+  musicHasPlayed = false;  // updates melodyHasPlayed to false to play again
+  noTone(BUZZER_PIN);      // stops the Passive buzzer
+}
+
+
+// function for resetting LED -------------------------------------------------------------
+void resetLED() {
+  LED.clear(); // Clear all LEDs
+  LED.show();  // Update LEDs to ensure they are off
+}
